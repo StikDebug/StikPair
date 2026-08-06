@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var controller = PairingController.shared
+    @State private var appleTVPin = ""
 
     var body: some View {
         VStack(spacing: 28) {
@@ -29,7 +30,17 @@ struct ContentView: View {
                 Button {
                     controller.start()
                 } label: {
-                    Text("Pair")
+                    Text("Pair iPhone or iPad")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.large)
+
+                Button {
+                    controller.browseForAppleTVs()
+                } label: {
+                    Text("Pair Apple TV")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                 }
@@ -76,6 +87,73 @@ struct ContentView: View {
                     .padding(.vertical, 14)
                     .glassEffect(.regular, in: .capsule)
                 ProgressView()
+            }
+
+        case .browsingAppleTV:
+            VStack(spacing: 16) {
+                Text("Choose an Apple TV")
+                    .font(.headline)
+                Text("On Apple TV, open **Settings › Remotes and Devices › Remote App and Devices**.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+
+                if controller.appleTVs.isEmpty {
+                    ProgressView("Looking for Apple TVs…")
+                } else {
+                    ForEach(controller.appleTVs) { device in
+                        Button {
+                            appleTVPin = ""
+                            controller.pairAppleTV(device)
+                        } label: {
+                            Label(device.name, systemImage: "appletv")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glass)
+                        .controlSize(.large)
+                    }
+                }
+
+                Button("Cancel") { controller.cancelAppleTVPairing() }
+                    .buttonStyle(.glass)
+            }
+
+        case .enteringAppleTVPin(let device):
+            VStack(spacing: 16) {
+                Text("Pair with \(device.name)")
+                    .font(.headline)
+                Text("Enter the six-digit code shown on your Apple TV.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                TextField("000000", text: $appleTVPin)
+                    .keyboardType(.numberPad)
+                    .textContentType(.oneTimeCode)
+                    .multilineTextAlignment(.center)
+                    .font(.system(size: 32, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .onChange(of: appleTVPin) { _, value in
+                        appleTVPin = String(value.filter(\.isNumber).prefix(6))
+                    }
+                    .padding()
+                    .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                Button("Pair") {
+                    controller.submitAppleTVPin(appleTVPin)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.large)
+                .disabled(appleTVPin.count != 6)
+                Button("Cancel") { controller.cancelAppleTVPairing() }
+                    .buttonStyle(.glass)
+            }
+
+        case .pairingAppleTV(let name):
+            VStack(spacing: 16) {
+                ProgressView()
+                Text("Pairing with \(name)…")
+                    .foregroundStyle(.secondary)
+                Button("Cancel") { controller.cancelAppleTVPairing() }
+                    .buttonStyle(.glass)
             }
 
         case .success(let device):

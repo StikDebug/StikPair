@@ -8,11 +8,12 @@
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
+use std::sync::{mpsc, Arc, Mutex};
 
 use idevice::remote_pairing::{
-    PairableHost, PairableHostInfo, RpPairingFile, RpPairingSocket,
+    PairableHost, PairableHostInfo, RemotePairingClient, RpPairingFile, RpPairingSocket,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 pub type StikPairReadyCb = Option<
     extern "C" fn(
@@ -26,6 +27,12 @@ pub type StikPairReadyCb = Option<
 >;
 
 pub type StikPairPinCb = Option<extern "C" fn(pin: *const c_char, ctx: *mut c_void)>;
+pub type StikPairAppleTvPinCb = Option<extern "C" fn(ctx: *mut c_void)>;
+
+#[repr(C)]
+pub struct StikPairAppleTvSession {
+    pin_sender: Mutex<Option<mpsc::Sender<String>>>,
+}
 
 #[repr(C)]
 pub struct StikPairResult {
@@ -92,7 +99,11 @@ pub unsafe extern "C" fn stikpair_run_host(
     let name = opt_str(name, "StikPair");
     let model = opt_str(model, "Mac17,7");
     let out_path = opt_str(out_path, "rp_pairing_file.plist");
-    let cbs = Callbacks { ready: ready_cb, pin: pin_cb, ctx };
+    let cbs = Callbacks {
+        ready: ready_cb,
+        pin: pin_cb,
+        ctx,
+    };
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -118,6 +129,114 @@ pub unsafe extern "C" fn stikpair_run_host(
             (*out).error = cstr(e);
             1
         }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn stikpair_apple_tv_session_new() -> *mut StikPairAppleTvSession {
+    Box::into_raw(Box::new(StikPairAppleTvSession {
+        pin_sender: Mutex::new(None),
+    }))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stikpair_apple_tv_session_run(
+    session: *mut StikPairAppleTvSession,
+    host: *const c_char,
+    port: u16,
+    name: *const c_char,
+    out_path: *const c_char,
+    pin_cb: StikPairAppleTvPinCb,
+    ctx: *mut c_void,
+    out: *mut StikPairResult,
+) -> i32 {
+    if session.is_null() || out.is_null() {
+        return 2;
+    }
+    *out = StikPairResult::empty();
+
+    let host = opt_str(host, "");
+    let name = opt_str(name, "StikPair");
+    let out_path = opt_str(out_path, "rp_pairing_file.plist");
+    if host.is_empty() {
+        (*out).error = cstr("invalid Apple TV address");
+        return 1;
+    }
+
+    let (pin_sender, pin_receiver) = mpsc::channel();
+    *(*session).pin_sender.lock().unwrap() = Some(pin_sender);
+    let callbacks = AppleTvCallbacks { pin: pin_cb, ctx };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            (*out).error = cstr(format!("failed to start runtime: {e}"));
+            return 1;
+        }
+    };
+
+    let result = rt.block_on(pair_apple_tv(
+        host,
+        port,
+        name,
+        out_path,
+        pin_receiver,
+        callbacks,
+    ));
+    *(*session).pin_sender.lock().unwrap() = None;
+
+    match result {
+        Ok(res) => {
+            (*out).device_name = cstr(res.name);
+            (*out).device_model = cstr(res.model);
+            (*out).device_udid = cstr(res.udid);
+            (*out).pairing_file_path = cstr(res.path);
+            (*out).host_alt_irk_hex = cstr(res.host_alt_irk_hex);
+            0
+        }
+        Err(e) => {
+            (*out).error = cstr(e);
+            1
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stikpair_apple_tv_session_submit_pin(
+    session: *mut StikPairAppleTvSession,
+    pin: *const c_char,
+) -> i32 {
+    if session.is_null() {
+        return 2;
+    }
+    let pin = opt_str(pin, "");
+    if pin.len() != 6 || !pin.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 1;
+    }
+    let Some(sender) = (*session).pin_sender.lock().unwrap().take() else {
+        return 2;
+    };
+    if sender.send(pin).is_ok() {
+        0
+    } else {
+        2
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stikpair_apple_tv_session_cancel(session: *mut StikPairAppleTvSession) {
+    if !session.is_null() {
+        (*session).pin_sender.lock().unwrap().take();
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn stikpair_apple_tv_session_free(session: *mut StikPairAppleTvSession) {
+    if !session.is_null() {
+        drop(Box::from_raw(session));
     }
 }
 
@@ -193,6 +312,62 @@ async fn run(
     })
 }
 
+async fn pair_apple_tv(
+    host: String,
+    port: u16,
+    name: String,
+    out_path: String,
+    pin_receiver: mpsc::Receiver<String>,
+    callbacks: AppleTvCallbacks,
+) -> Result<Paired, String> {
+    let mut pairing_file = RpPairingFile::generate(&name);
+    let stream = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| format!("failed to connect to Apple TV: {e}"))?;
+    let mut client = RemotePairingClient::new(RpPairingSocket::new(stream), &name);
+    let pin_receiver = Arc::new(Mutex::new(pin_receiver));
+    client
+        .connect(&mut pairing_file, || {
+            let pin_receiver = pin_receiver.clone();
+            async move {
+                if let Some(callback) = callbacks.pin {
+                    callback(callbacks.ctx);
+                }
+                pin_receiver
+                    .lock()
+                    .ok()
+                    .and_then(|receiver| receiver.recv().ok())
+                    .unwrap_or_default()
+            }
+        })
+        .await
+        .map_err(|e| format!("Apple TV pairing failed: {e}"))?;
+
+    let peer = client
+        .paired_peer_device()
+        .map_err(|e| format!("failed to read Apple TV details: {e}"))?;
+    let paired = Paired {
+        name: peer.name.clone(),
+        model: peer.model.clone(),
+        udid: peer.remotepairing_udid.clone(),
+        path: out_path.clone(),
+        host_alt_irk_hex: String::new(),
+    };
+    pairing_file
+        .write_to_file(&out_path)
+        .await
+        .map_err(|e| format!("failed to write pairing file: {e}"))?;
+    Ok(paired)
+}
+
+#[derive(Clone, Copy)]
+struct AppleTvCallbacks {
+    pin: StikPairAppleTvPinCb,
+    ctx: *mut c_void,
+}
+
+unsafe impl Send for AppleTvCallbacks {}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -214,7 +389,9 @@ fn emit_ready(cbs: &Callbacks, service_id: &str, port: u16, host_info: &Pairable
     let key_ptrs: Vec<*const c_char> = keys.iter().map(|s| s.as_ptr()).collect();
     let val_ptrs: Vec<*const c_char> = vals.iter().map(|s| s.as_ptr()).collect();
 
-    let Ok(id_c) = CString::new(service_id) else { return };
+    let Ok(id_c) = CString::new(service_id) else {
+        return;
+    };
     cb(
         cbs.ctx,
         id_c.as_ptr(),

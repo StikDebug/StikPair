@@ -36,10 +36,11 @@
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>StikPair advertises a pairing service so this device can pair with it.</string>
+    <string>StikPair uses your local network to discover devices and complete pairing.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_remotepairing-pairable-host._tcp</string>
+        <string>_remotepairing-manual-pairing._tcp</string>
         <!-- Throwaway type used only to trigger the Local Network prompt. -->
         <string>_stikpairprobe._tcp</string>
     </array>

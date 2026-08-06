@@ -1,4 +1,5 @@
 import BackgroundTasks
+import Combine
 import Foundation
 import StikPairFFI
 import UserNotifications
@@ -13,6 +14,9 @@ final class PairingController: ObservableObject {
         case idle
         case waiting
         case showPin(String)
+        case browsingAppleTV
+        case enteringAppleTVPin(AppleTVDevice)
+        case pairingAppleTV(String)
         case success(PairedDevice)
         case failed(String)
     }
@@ -25,6 +29,7 @@ final class PairingController: ObservableObject {
     }
 
     @Published var phase: Phase = .idle
+    @Published private(set) var appleTVs: [AppleTVDevice] = []
 
     @Published var keepAliveAudio: Bool = UserDefaults.standard.bool(forKey: "keepAlive.audio") {
         didSet { UserDefaults.standard.set(keepAliveAudio, forKey: "keepAlive.audio") }
@@ -39,16 +44,27 @@ final class PairingController: ObservableObject {
     private var netService: NetService?
     private let localNetwork = LocalNetworkAuthorization()
     private let keepAlive = KeepAlive()
+    private let appleTVDiscovery = AppleTVDiscovery()
+    private var discoverySubscription: AnyCancellable?
+    private var appleTVSession: OpaquePointer?
+    private var activeAppleTV: AppleTVDevice?
+    private var appleTVCancelled = false
 
     private var bgTask: BGContinuedProcessingTask?
     private var pairingStarted = false
     private var taskFinished = false
 
     var isRunning: Bool {
+        if pairingStarted { return true }
         switch phase {
-        case .waiting, .showPin: return true
+        case .waiting, .showPin, .enteringAppleTVPin, .pairingAppleTV: return true
         default: return false
         }
+    }
+
+    private init() {
+        discoverySubscription = appleTVDiscovery.$devices
+            .sink { [weak self] devices in self?.appleTVs = devices }
     }
 
     nonisolated func registerBackgroundTask() {
@@ -82,8 +98,97 @@ final class PairingController: ObservableObject {
         }
     }
 
+    func browseForAppleTVs() {
+        guard !isRunning else { return }
+        phase = .browsingAppleTV
+        Task {
+            let authorized = await localNetwork.request()
+            guard case .browsingAppleTV = phase else { return }
+            guard authorized else {
+                phase = .failed("Local Network permission is required. Enable it in Settings › StikPair › Local Network, then try again.")
+                return
+            }
+            appleTVDiscovery.start()
+        }
+    }
+
+    func pairAppleTV(_ device: AppleTVDevice) {
+        guard !pairingStarted, let session = stikpair_apple_tv_session_new() else { return }
+        appleTVDiscovery.stop()
+        appleTVSession = session
+        activeAppleTV = device
+        appleTVCancelled = false
+        pairingStarted = true
+        phase = .pairingAppleTV(device.name)
+
+        let name = hostName
+        let outPath = Self.pairingFilePath()
+        let sessionBits = UInt(bitPattern: session)
+        let ctxBits = UInt(bitPattern: Unmanaged.passUnretained(self).toOpaque())
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let session = OpaquePointer(bitPattern: sessionBits) else { return }
+            let ctx = UnsafeMutableRawPointer(bitPattern: ctxBits)
+            var result = StikPairResult()
+            let rc = device.host.withCString { hostC in
+                name.withCString { nameC in
+                    outPath.withCString { outC in
+                        stikpair_apple_tv_session_run(
+                            session, hostC, UInt16(device.port), nameC, outC,
+                            appleTVPinCallback, ctx, &result)
+                    }
+                }
+            }
+
+            let outcome: Phase
+            if rc == 0 {
+                outcome = .success(PairedDevice(
+                    name: cString(result.device_name),
+                    model: cString(result.device_model),
+                    udid: cString(result.device_udid),
+                    pairingFilePath: cString(result.pairing_file_path)))
+            } else {
+                let message = cString(result.error)
+                outcome = .failed(message.isEmpty ? "Apple TV pairing failed (code \(rc))" : message)
+            }
+            stikpair_result_free(&result)
+
+            DispatchQueue.main.async {
+                let cancelled = self.appleTVCancelled
+                if self.appleTVSession == session {
+                    self.appleTVSession = nil
+                }
+                stikpair_apple_tv_session_free(session)
+                self.activeAppleTV = nil
+                self.pairingStarted = false
+                guard !cancelled else { return }
+                self.phase = outcome
+                if case .success = outcome {
+                    self.postReturnNotification()
+                }
+            }
+        }
+    }
+
+    func submitAppleTVPin(_ pin: String) {
+        guard pin.count == 6, pin.allSatisfy(\.isNumber), let session = appleTVSession else { return }
+        let rc = pin.withCString { stikpair_apple_tv_session_submit_pin(session, $0) }
+        if rc == 0, let device = activeAppleTV {
+            phase = .pairingAppleTV(device.name)
+        }
+    }
+
+    func cancelAppleTVPairing() {
+        appleTVCancelled = true
+        if let session = appleTVSession {
+            stikpair_apple_tv_session_cancel(session)
+        }
+        appleTVDiscovery.stop()
+        phase = .idle
+    }
+
     func reset() {
         guard !isRunning else { return }
+        appleTVDiscovery.stop()
         phase = .idle
     }
 
@@ -200,6 +305,11 @@ final class PairingController: ObservableObject {
         }
     }
 
+    fileprivate func presentAppleTVPin() {
+        guard !appleTVCancelled, let device = activeAppleTV else { return }
+        phase = .enteringAppleTVPin(device)
+    }
+
     private func stopAdvertising() {
         netService?.stop()
         netService = nil
@@ -250,6 +360,14 @@ private let pinCallback: StikPairPinCb = { pin, ctx in
     let pinString = String(cString: pin)
     DispatchQueue.main.async {
         controller.presentPin(pinString)
+    }
+}
+
+private let appleTVPinCallback: StikPairAppleTvPinCb = { ctx in
+    guard let ctx = ctx else { return }
+    let controller = Unmanaged<PairingController>.fromOpaque(ctx).takeUnretainedValue()
+    DispatchQueue.main.async {
+        controller.presentAppleTVPin()
     }
 }
 

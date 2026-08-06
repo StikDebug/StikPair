@@ -18,6 +18,9 @@ typedef void (*StikPairReadyCb)(void *ctx,
                                 size_t txt_count);
 
 typedef void (*StikPairPinCb)(const char *pin, void *ctx);
+typedef void (*StikPairAppleTvPinCb)(void *ctx);
+
+typedef struct StikPairAppleTvSession StikPairAppleTvSession;
 
 typedef struct {
     char *error;
@@ -37,6 +40,23 @@ int32_t stikpair_run_host(const char *bind_addr,
                           StikPairPinCb pin_cb,
                           void *ctx,
                           StikPairResult *out);
+
+StikPairAppleTvSession *stikpair_apple_tv_session_new(void);
+
+int32_t stikpair_apple_tv_session_run(StikPairAppleTvSession *session,
+                                      const char *host,
+                                      uint16_t port,
+                                      const char *name,
+                                      const char *out_path,
+                                      StikPairAppleTvPinCb pin_cb,
+                                      void *ctx,
+                                      StikPairResult *out);
+
+int32_t stikpair_apple_tv_session_submit_pin(StikPairAppleTvSession *session,
+                                             const char *pin);
+
+void stikpair_apple_tv_session_cancel(StikPairAppleTvSession *session);
+void stikpair_apple_tv_session_free(StikPairAppleTvSession *session);
 
 void stikpair_result_free(StikPairResult *r);
 
