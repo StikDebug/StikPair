@@ -1,6 +1,6 @@
 # StikPair
 
-A simple SwiftUI iOS app that creates a pairing file **on-device**, using iOS 27+ or tvOS 11+ wireless pairing. Powered by [idevice](https://github.com/jkcoxson/idevice).
+A simple SwiftUI iOS app that creates a pairing file **on-device**, using iOS 27+ or tvOS 11+ wireless pairing. Powered by [idevice](https://github.com/jkcoxson/idevice). Replaced by [StikDebug](https://github.com/StikDebug/StikDebug).
 
 ## Requirements
 
